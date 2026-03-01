@@ -6,7 +6,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const KALSHI_BASE = "https://api.kalshi.com/trade-api/v2";
+const KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2";
 let token = null;
 
 // Login to Kalshi
