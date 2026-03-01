@@ -41,18 +41,34 @@ async function getMarkets(limit = 100) {
 function getMispricingSignals(markets) {
   return markets
     .filter(m => {
+      // Filter out parlay/cross-category markets
+      if (m.ticker.includes("CROSSCATEGORY") || m.ticker.includes("MULTIGAME")) return false;
+      // Filter out sports markets
+      const title = m.title.toLowerCase();
+      if (title.includes("wins by") || title.includes("points scored") || 
+          title.includes("rebounds") || title.includes("assists") ||
+          title.includes(": 1+") || title.includes(": 2+") || title.includes(": 3+")) return false;
       const sum = (m.yes_bid + m.no_bid) / 100;
       const yes = m.yes_ask / 100;
-      return sum < 0.92 && yes > 0.05 && yes < 0.95;
+      const no = m.no_ask / 100;
+      return sum < 0.92 && yes > 0.05 && yes < 0.95 && no < 100;
     })
     .map(m => {
       const yes = m.yes_ask / 100;
       const sum = (m.yes_bid + m.no_bid) / 100;
       const edge = parseFloat((Math.abs(0.5 - Math.min(yes, 1 - yes))).toFixed(2));
+      // Detect category from ticker
+      const ticker = m.ticker.toLowerCase();
+      const title = m.title.toLowerCase();
+      let category = "economic";
+      if (ticker.includes("weather") || ticker.includes("snow") || ticker.includes("rain") || ticker.includes("temp")) category = "weather";
+      else if (ticker.includes("nba") || ticker.includes("nfl") || ticker.includes("mlb") || ticker.includes("nhl") || ticker.includes("sport") || title.includes("game") || title.includes("match")) category = "sports";
+      else if (ticker.includes("pol") || ticker.includes("elect") || title.includes("president") || title.includes("senate") || title.includes("congress")) category = "political";
+
       return {
         id: m.ticker,
         strategy: "Mispricing Detector",
-        category: "economic",
+        category,
         market: m.title,
         ticker: m.ticker,
         side: yes < 0.5 ? "YES" : "NO",
