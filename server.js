@@ -11,20 +11,9 @@ let token = null;
 
 // Login to Kalshi
 async function login() {
-  try {
-    const res = await fetch(`${KALSHI_BASE}/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        email: process.env.KALSHI_EMAIL,
-        password: process.env.KALSHI_PASSWORD,
-      }),
-    });
-    const data = await res.json();
-    token = data.token;
-    console.log("Logged into Kalshi successfully");
-  } catch (e) {
-    console.error("Kalshi login failed:", e.message);
+  token = process.env.KALSHI_API_KEY;
+  console.log("Kalshi API key loaded:", token ? "yes" : "no");
+}
   }
 }
 
