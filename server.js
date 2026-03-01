@@ -37,6 +37,7 @@ async function getMarkets(limit = 100) {
   return res.json();
 }
 
+// ─── MISPRICING STRATEGY ─────────────────────────────────────────────────────
 function getMispricingSignals(markets) {
   return markets
     .filter(m => {
@@ -69,18 +70,145 @@ function getMispricingSignals(markets) {
     });
 }
 
+// ─── NOAA WEATHER STRATEGY ───────────────────────────────────────────────────
+async function getNOAASignals(markets) {
+  const signals = [];
+  const weatherMarkets = markets.filter(m =>
+    m.title.toLowerCase().includes("snow") ||
+    m.title.toLowerCase().includes("rain") ||
+    m.title.toLowerCase().includes("temperature") ||
+    m.title.toLowerCase().includes("hurricane") ||
+    m.title.toLowerCase().includes("inches")
+  );
+
+  for (const market of weatherMarkets.slice(0, 5)) {
+    try {
+      const pointRes = await fetch("https://api.weather.gov/points/40.7128,-74.0060");
+      const pointData = await pointRes.json();
+      if (!pointData.properties) continue;
+
+      const forecastRes = await fetch(pointData.properties.forecast);
+      const forecastData = await forecastRes.json();
+      if (!forecastData.properties) continue;
+
+      const periods = forecastData.properties.periods;
+      const pop = periods[0]?.probabilityOfPrecipitation?.value;
+      if (pop === null || pop === undefined) continue;
+
+      const noaaProb = pop / 100;
+      const kalshiProb = market.yes_ask / 100;
+      const edge = noaaProb - kalshiProb;
+
+      if (Math.abs(edge) > 0.07) {
+        signals.push({
+          id: `noaa_${market.ticker}`,
+          strategy: "NOAA Weather Model",
+          category: "weather",
+          market: market.title,
+          ticker: market.ticker,
+          side: edge > 0 ? "YES" : "NO",
+          yourEdge: parseFloat(Math.abs(edge).toFixed(2)),
+          modelProb: parseFloat(noaaProb.toFixed(2)),
+          kalshiProb: parseFloat(kalshiProb.toFixed(2)),
+          recommendedSize: Math.min(75, Math.round(Math.abs(edge) * 300)),
+          maxSize: 100,
+          dataSource: "NOAA Weather API (free)",
+          reasoning: `NOAA gives ${Math.round(noaaProb * 100)}% precipitation probability. Kalshi prices it at ${Math.round(kalshiProb * 100)}c. Edge: ${Math.round(Math.abs(edge) * 100)} points.`,
+          confidence: Math.abs(edge) > 0.12 ? "High" : "Medium",
+          expiresIn: market.close_time ? new Date(market.close_time).toLocaleDateString() : "soon",
+          timestamp: Date.now(),
+        });
+      }
+    } catch (e) {
+      console.error("NOAA error:", e.message);
+    }
+  }
+  return signals;
+}
+
+// ─── FED RATE STRATEGY ───────────────────────────────────────────────────────
+async function getFedSignals(markets) {
+  const signals = [];
+  const fedMarkets = markets.filter(m =>
+    m.title.toLowerCase().includes("fed") ||
+    m.title.toLowerCase().includes("fomc") ||
+    m.title.toLowerCase().includes("interest rate") ||
+    m.title.toLowerCase().includes("federal funds")
+  );
+
+  if (fedMarkets.length === 0) return signals;
+
+  try {
+    const fredRes = await fetch(
+      `https://api.stlouisfed.org/fred/series/observations?series_id=FEDTARMD&api_key=${process.env.FRED_API_KEY}&sort_order=desc&limit=1&file_type=json`
+    );
+    const fredData = await fredRes.json();
+    const currentRate = parseFloat(fredData.observations?.[0]?.value);
+    if (isNaN(currentRate)) return signals;
+
+    console.log(`Current Fed rate from FRED: ${currentRate}%`);
+
+    for (const market of fedMarkets.slice(0, 5)) {
+      const kalshiProb = market.yes_ask / 100;
+      const isHold = market.title.toLowerCase().includes("hold") ||
+                     market.title.toLowerCase().includes("unchanged") ||
+                     market.title.toLowerCase().includes("pause");
+      const modelProb = isHold ? 0.75 : 0.35;
+      const edge = modelProb - kalshiProb;
+
+      if (Math.abs(edge) > 0.05) {
+        signals.push({
+          id: `fed_${market.ticker}`,
+          strategy: "Fed Rate Tracker",
+          category: "economic",
+          market: market.title,
+          ticker: market.ticker,
+          side: edge > 0 ? "YES" : "NO",
+          yourEdge: parseFloat(Math.abs(edge).toFixed(2)),
+          modelProb: parseFloat(modelProb.toFixed(2)),
+          kalshiProb: parseFloat(kalshiProb.toFixed(2)),
+          recommendedSize: Math.min(100, Math.round(Math.abs(edge) * 400)),
+          maxSize: 150,
+          dataSource: "FRED (St. Louis Fed)",
+          reasoning: `Current Fed funds rate: ${currentRate}%. Model probability: ${Math.round(modelProb * 100)}%. Kalshi: ${Math.round(kalshiProb * 100)}c. Edge: ${Math.round(Math.abs(edge) * 100)} points.`,
+          confidence: Math.abs(edge) > 0.08 ? "High" : "Medium",
+          expiresIn: market.close_time ? new Date(market.close_time).toLocaleDateString() : "soon",
+          timestamp: Date.now(),
+        });
+      }
+    }
+  } catch (e) {
+    console.error("Fed strategy error:", e.message);
+  }
+  return signals;
+}
+
+// ─── API ENDPOINTS ───────────────────────────────────────────────────────────
 app.get("/api/health", (req, res) => {
-  const hasKey = !!process.env.KALSHI_KEY_ID;
-  const hasPrivate = !!process.env.KALSHI_PRIVATE_KEY;
-  res.json({ status: "ok", loggedIn: hasKey && hasPrivate, hasKeyId: hasKey, hasPrivateKey: hasPrivate });
+  res.json({
+    status: "ok",
+    loggedIn: !!process.env.KALSHI_KEY_ID && !!process.env.KALSHI_PRIVATE_KEY,
+    hasKeyId: !!process.env.KALSHI_KEY_ID,
+    hasPrivateKey: !!process.env.KALSHI_PRIVATE_KEY,
+    hasFred: !!process.env.FRED_API_KEY,
+  });
 });
 
 app.get("/api/signals", async (req, res) => {
   try {
     const { markets } = await getMarkets(100);
     if (!markets) return res.json({ signals: [] });
-    const signals = getMispricingSignals(markets).sort((a, b) => b.yourEdge - a.yourEdge);
-    console.log(`Signals found: ${signals.length}`);
+
+    const [mispricing, noaa, fed] = await Promise.all([
+      Promise.resolve(getMispricingSignals(markets)),
+      getNOAASignals(markets),
+      getFedSignals(markets),
+    ]);
+
+    const signals = [...mispricing, ...noaa, ...fed]
+      .sort((a, b) => b.yourEdge - a.yourEdge);
+
+    console.log(`Signals — mispricing: ${mispricing.length}, noaa: ${noaa.length}, fed: ${fed.length}`);
     res.json({ signals });
   } catch (e) {
     console.error("Signals error:", e.message);
@@ -143,6 +271,5 @@ app.post("/api/bet", async (req, res) => {
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Kalshi backend running on port ${PORT}`);
-  console.log(`Key ID present: ${!!process.env.KALSHI_KEY_ID}`);
-  console.log(`Private key present: ${!!process.env.KALSHI_PRIVATE_KEY}`);
+  console.log(`Key ID: ${!!process.env.KALSHI_KEY_ID}, Private key: ${!!process.env.KALSHI_PRIVATE_KEY}, FRED: ${!!process.env.FRED_API_KEY}`);
 });
