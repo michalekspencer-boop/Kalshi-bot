@@ -1,22 +1,38 @@
 import express from "express";
 import fetch from "node-fetch";
 import cors from "cors";
+import crypto from "crypto";
 
 const app = express();
 app.use(cors({ origin: "*", methods: ["GET", "POST"], allowedHeaders: ["Content-Type"] }));
 app.use(express.json());
 
 const KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2";
-let token = null;
 
-async function login() {
-  token = process.env.KALSHI_API_KEY;
-  console.log("Kalshi API key loaded:", token ? "yes" : "no");
+function signRequest(method, path, timestamp) {
+  const message = `${timestamp}${method}${path}`;
+  const privateKey = process.env.KALSHI_PRIVATE_KEY.replace(/\\n/g, "\n");
+  const sign = crypto.createSign("SHA256");
+  sign.update(message);
+  sign.end();
+  return sign.sign({ key: privateKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST }, "base64");
+}
+
+function authHeaders(method, path) {
+  const timestamp = Date.now().toString();
+  const signature = signRequest(method, path, timestamp);
+  return {
+    "Content-Type": "application/json",
+    "KALSHI-ACCESS-KEY": process.env.KALSHI_KEY_ID,
+    "KALSHI-ACCESS-SIGNATURE": signature,
+    "KALSHI-ACCESS-TIMESTAMP": timestamp,
+  };
 }
 
 async function getMarkets(limit = 100) {
-  const res = await fetch(`${KALSHI_BASE}/markets?limit=${limit}&status=open`, {
-    headers: { "Authorization": `Bearer ${token}` },
+  const path = `/trade-api/v2/markets?limit=${limit}&status=open`;
+  const res = await fetch(`https://api.elections.kalshi.com${path}`, {
+    headers: authHeaders("GET", path),
   });
   return res.json();
 }
@@ -30,19 +46,18 @@ function getMispricingSignals(markets) {
     })
     .map(m => {
       const yes = m.yes_ask / 100;
-      const no = m.no_ask / 100;
       const sum = (m.yes_bid + m.no_bid) / 100;
-      const edge = parseFloat((Math.abs(0.5 - Math.min(yes, no))).toFixed(2));
+      const edge = parseFloat((Math.abs(0.5 - Math.min(yes, 1 - yes))).toFixed(2));
       return {
         id: m.ticker,
         strategy: "Mispricing Detector",
         category: "economic",
         market: m.title,
         ticker: m.ticker,
-        side: yes < no ? "YES" : "NO",
+        side: yes < 0.5 ? "YES" : "NO",
         yourEdge: edge,
-        modelProb: parseFloat((1 - Math.min(yes, no)).toFixed(2)),
-        kalshiProb: parseFloat(Math.min(yes, no).toFixed(2)),
+        modelProb: parseFloat((yes < 0.5 ? 1 - yes : yes).toFixed(2)),
+        kalshiProb: parseFloat(Math.min(yes, 1 - yes).toFixed(2)),
         recommendedSize: 25,
         maxSize: 100,
         dataSource: "Kalshi live market data",
@@ -55,12 +70,13 @@ function getMispricingSignals(markets) {
 }
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", loggedIn: !!token });
+  const hasKey = !!process.env.KALSHI_KEY_ID;
+  const hasPrivate = !!process.env.KALSHI_PRIVATE_KEY;
+  res.json({ status: "ok", loggedIn: hasKey && hasPrivate, hasKeyId: hasKey, hasPrivateKey: hasPrivate });
 });
 
 app.get("/api/signals", async (req, res) => {
   try {
-    if (!token) await login();
     const { markets } = await getMarkets(100);
     if (!markets) return res.json({ signals: [] });
     const signals = getMispricingSignals(markets).sort((a, b) => b.yourEdge - a.yourEdge);
@@ -74,16 +90,16 @@ app.get("/api/signals", async (req, res) => {
 
 app.post("/api/bet", async (req, res) => {
   try {
-    if (!token) await login();
     const { ticker, side, dollarAmount } = req.body;
     console.log(`Bet request: ${ticker} ${side} $${dollarAmount}`);
 
-    const mktRes = await fetch(`${KALSHI_BASE}/markets/${ticker}`, {
-      headers: { "Authorization": `Bearer ${token}` },
+    const mktPath = `/trade-api/v2/markets/${ticker}`;
+    const mktRes = await fetch(`https://api.elections.kalshi.com${mktPath}`, {
+      headers: authHeaders("GET", mktPath),
     });
     const mktData = await mktRes.json();
     if (!mktData.market) {
-      console.error("Market not found:", mktData);
+      console.error("Market not found:", JSON.stringify(mktData));
       return res.json({ success: false, error: "Market not found" });
     }
 
@@ -96,12 +112,10 @@ app.post("/api/bet", async (req, res) => {
     const contracts = Math.max(1, Math.floor((dollarAmount * 100) / price));
     console.log(`Placing order: ${contracts} contracts at ${price}c`);
 
-    const orderRes = await fetch(`${KALSHI_BASE}/portfolio/orders`, {
+    const orderPath = `/trade-api/v2/portfolio/orders`;
+    const orderRes = await fetch(`https://api.elections.kalshi.com${orderPath}`, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
+      headers: authHeaders("POST", orderPath),
       body: JSON.stringify({
         ticker,
         action: "buy",
@@ -117,7 +131,7 @@ app.post("/api/bet", async (req, res) => {
     console.log("Order response:", JSON.stringify(order));
 
     if (order.error) {
-      return res.json({ success: false, error: order.error });
+      return res.json({ success: false, error: order.error.message || order.error });
     }
     res.json({ success: true, order, contracts, price });
   } catch (e) {
@@ -129,5 +143,6 @@ app.post("/api/bet", async (req, res) => {
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Kalshi backend running on port ${PORT}`);
-  login();
+  console.log(`Key ID present: ${!!process.env.KALSHI_KEY_ID}`);
+  console.log(`Private key present: ${!!process.env.KALSHI_PRIVATE_KEY}`);
 });
