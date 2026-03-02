@@ -1,522 +1,332 @@
-import { useState, useEffect } from "react";
+import express from "express";
+import fetch from "node-fetch";
+import cors from "cors";
+import crypto from "crypto";
 
-const BACKEND_URL = "https://kalshi-bot-production-db66.up.railway.app";
+const app = express();
+app.use(cors({ origin: "*", methods: ["GET", "POST"], allowedHeaders: ["Content-Type"] }));
+app.use(express.json());
 
-const CATEGORY_COLOR = { weather: "#a78bfa", economic: "#38bdf8", sports: "#4ade80", political: "#fb923c" };
-const CATEGORY_ICON = { weather: "◈", economic: "◆", sports: "◉", political: "◇" };
-const CONFIDENCE_COLOR = { High: "#4ade80", Medium: "#facc15", Low: "#f87171" };
-const QUALITY_COLOR = (score) => score >= 65 ? "#4ade80" : score >= 35 ? "#facc15" : "#f87171";
+const DAILY_LIMIT = 50;
+let autoTradeEnabled = true;
+let autoTradeLog = [];
+let placedTickers = new Set();
 
-function timeAgo(ts) {
-  const diff = Date.now() - ts;
-  const mins = Math.floor(diff / 60000);
-  if (mins < 60) return `${mins}m ago`;
-  if (mins < 1440) return `${Math.floor(mins / 60)}h ago`;
-  return `${Math.floor(mins / 1440)}d ago`;
+function getDailySpend() {
+  const midnight = new Date(); midnight.setHours(0,0,0,0);
+  return autoTradeLog
+    .filter(e => e.type === "BET_PLACED" && e.timestamp >= midnight.getTime())
+    .reduce((sum, e) => sum + (e.data?.amount || 0), 0);
 }
 
-function AutoTradePanel() {
-  const [log, setLog] = useState([]);
-  const [enabled, setEnabled] = useState(true);
-  const [dailySpend, setDailySpend] = useState(0);
-  const [dailyLimit, setDailyLimit] = useState(50);
-  const [loading, setLoading] = useState(true);
+function logActivity(type, message, data = {}) {
+  const entry = { type, message, data, timestamp: Date.now() };
+  autoTradeLog.unshift(entry);
+  if (autoTradeLog.length > 100) autoTradeLog = autoTradeLog.slice(0, 100);
+  console.log(`[${type}] ${message}`);
+}
 
-  const fetchLog = async () => {
+function signRequest(method, path, timestamp) {
+  const message = `${timestamp}${method}${path}`;
+  const privateKey = process.env.KALSHI_PRIVATE_KEY.replace(/\\n/g, "\n");
+  const sign = crypto.createSign("SHA256");
+  sign.update(message);
+  sign.end();
+  return sign.sign({ key: privateKey, padding: crypto.constants.RSA_PKCS1_PSS_PADDING, saltLength: crypto.constants.RSA_PSS_SALTLEN_DIGEST }, "base64");
+}
+
+function authHeaders(method, path) {
+  const timestamp = Date.now().toString();
+  const signature = signRequest(method, path, timestamp);
+  return {
+    "Content-Type": "application/json",
+    "KALSHI-ACCESS-KEY": process.env.KALSHI_KEY_ID,
+    "KALSHI-ACCESS-SIGNATURE": signature,
+    "KALSHI-ACCESS-TIMESTAMP": timestamp,
+  };
+}
+
+async function getMarkets(limit = 100) {
+  const path = `/trade-api/v2/markets?limit=${limit}&status=open`;
+  const res = await fetch(`https://api.elections.kalshi.com${path}`, {
+    headers: authHeaders("GET", path),
+  });
+  return res.json();
+}
+
+function calcQualityScore(edge, dataSource, expiresIn, confidence) {
+  let score = 0;
+  score += Math.min(40, Math.round(edge * 200));
+  const sourceScores = { "NOAA Weather API (free)": 30, "FRED (St. Louis Fed)": 28, "Kalshi live market data": 15 };
+  score += sourceScores[dataSource] || 10;
+  if (expiresIn) {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/autotrade/log`);
-      const data = await res.json();
-      setLog(data.log || []);
-      setEnabled(data.enabled);
-      setDailySpend(data.dailySpend || 0);
-      setDailyLimit(data.dailyLimit || 50);
-    } catch (e) {
-      console.error("Failed to fetch log:", e);
-    } finally {
-      setLoading(false);
-    }
-  };
+      const daysLeft = (new Date(expiresIn) - Date.now()) / (1000 * 60 * 60 * 24);
+      if (daysLeft >= 1 && daysLeft <= 7) score += 20;
+      else if (daysLeft > 7 && daysLeft <= 30) score += 10;
+      else if (daysLeft < 1) score += 5;
+    } catch (e) {}
+  }
+  if (confidence === "High") score += 10;
+  else if (confidence === "Medium") score += 5;
+  return Math.min(100, score);
+}
 
-  const toggleAutoTrade = async () => {
+function getQualityLabel(score) {
+  if (score >= 80) return "A+";
+  if (score >= 65) return "A";
+  if (score >= 50) return "B";
+  if (score >= 35) return "C";
+  return "D";
+}
+
+function getMispricingSignals(markets) {
+  return markets
+    .filter(m => {
+      if (m.ticker.includes("CROSSCATEGORY") || m.ticker.includes("MULTIGAME")) return false;
+      const title = m.title.toLowerCase();
+      if (title.includes("wins by") || title.includes("points scored") ||
+          title.includes("rebounds") || title.includes("assists") ||
+          title.includes(": 1+") || title.includes(": 2+") || title.includes(": 3+")) return false;
+      const sum = (m.yes_bid + m.no_bid) / 100;
+      const yes = m.yes_ask / 100;
+      const no = m.no_ask / 100;
+      return sum < 0.92 && yes > 0.05 && yes < 0.95 && no < 100;
+    })
+    .map(m => {
+      const yes = m.yes_ask / 100;
+      const sum = (m.yes_bid + m.no_bid) / 100;
+      const edge = parseFloat((Math.abs(0.5 - Math.min(yes, 1 - yes))).toFixed(2));
+      const ticker = m.ticker.toLowerCase();
+      const title = m.title.toLowerCase();
+      let category = "economic";
+      if (ticker.includes("weather") || ticker.includes("snow") || ticker.includes("rain") || ticker.includes("temp")) category = "weather";
+      else if (ticker.includes("nba") || ticker.includes("nfl") || ticker.includes("mlb") || ticker.includes("nhl") || ticker.includes("sport") || title.includes("game") || title.includes("match")) category = "sports";
+      else if (ticker.includes("pol") || ticker.includes("elect") || title.includes("president") || title.includes("senate") || title.includes("congress")) category = "political";
+      const expiresIn = m.close_time ? new Date(m.close_time).toLocaleDateString() : "unknown";
+      const confidence = edge > 0.1 ? "High" : "Medium";
+      const dataSource = "Kalshi live market data";
+      const qs = calcQualityScore(edge, dataSource, expiresIn, confidence);
+      return {
+        id: m.ticker, strategy: "Mispricing Detector", category,
+        market: m.title, ticker: m.ticker,
+        side: yes < 0.5 ? "YES" : "NO",
+        yourEdge: edge,
+        modelProb: parseFloat((yes < 0.5 ? 1 - yes : yes).toFixed(2)),
+        kalshiProb: parseFloat(Math.min(yes, 1 - yes).toFixed(2)),
+        recommendedSize: 25, maxSize: 100, dataSource,
+        reasoning: `Yes ask: ${m.yes_ask}c, No ask: ${m.no_ask}c. Combined bid price is ${Math.round(sum * 100)}c — potential mispricing detected.`,
+        confidence, expiresIn, qualityScore: qs, qualityLabel: getQualityLabel(qs), timestamp: Date.now(),
+      };
+    });
+}
+
+async function getNOAASignals(markets) {
+  const signals = [];
+  const weatherMarkets = markets.filter(m =>
+    m.title.toLowerCase().includes("snow") || m.title.toLowerCase().includes("rain") ||
+    m.title.toLowerCase().includes("temperature") || m.title.toLowerCase().includes("hurricane") ||
+    m.title.toLowerCase().includes("inches")
+  );
+  for (const market of weatherMarkets.slice(0, 5)) {
     try {
-      const res = await fetch(`${BACKEND_URL}/api/autotrade/toggle`, { method: "POST" });
-      const data = await res.json();
-      setEnabled(data.enabled);
-    } catch (e) {
-      console.error("Toggle failed:", e);
-    }
-  };
-
-  useEffect(() => {
-    fetchLog();
-    const interval = setInterval(fetchLog, 30000);
-    return () => clearInterval(interval);
-  }, []);
-
-  const betsPlaced = log.filter(e => e.type === "BET_PLACED");
-  const todayBets = betsPlaced.filter(e => Date.now() - e.timestamp < 86400000);
-
-  const LOG_COLORS = {
-    BET_PLACED: "#4ade80", BET_FAILED: "#f87171", SCAN: "#475569",
-    ERROR: "#f87171", ENABLED: "#4ade80", DISABLED: "#facc15", LIMIT: "#fb923c",
-  };
-
-  return (
-    <div style={{ animation: "fadeIn 0.3s ease" }}>
-      <div style={{ padding: "16px 20px", background: "#0a0f18", border: `1px solid ${enabled ? "#4ade8033" : "#f8717133"}`, borderRadius: 4, marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <div>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-            <div style={{ width: 8, height: 8, borderRadius: "50%", background: enabled ? "#4ade80" : "#f87171", animation: enabled ? "pulse 2s infinite" : "none" }} />
-            <div style={{ fontSize: 13, color: enabled ? "#4ade80" : "#f87171", fontWeight: 600 }}>AUTO-TRADING {enabled ? "ACTIVE" : "PAUSED"}</div>
-          </div>
-          <div style={{ fontSize: 11, color: "#475569" }}>Scans every 15 min · $5 max per bet · A-grade signals only · $50/day limit</div>
-        </div>
-        <button onClick={toggleAutoTrade} style={{ background: enabled ? "#1a0808" : "#0a1a0f", border: `1px solid ${enabled ? "#f87171" : "#4ade80"}`, color: enabled ? "#f87171" : "#4ade80", padding: "8px 16px", fontFamily: "inherit", fontSize: 11, cursor: "pointer", borderRadius: 2 }}>
-          {enabled ? "⏸ PAUSE" : "▶ RESUME"}
-        </button>
-      </div>
-
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginBottom: 20 }}>
-        {[
-          { label: "BETS TODAY", value: todayBets.length, color: "#38bdf8" },
-          { label: "ALL-TIME BETS", value: betsPlaced.length, color: "#4ade80" },
-          { label: "SPENT TODAY", value: `$${dailySpend}`, color: "#facc15" },
-          { label: "DAILY LIMIT", value: `$${dailyLimit}`, color: dailySpend >= dailyLimit ? "#f87171" : "#475569" },
-        ].map(s => (
-          <div key={s.label} style={{ padding: "14px", background: "#0a0f18", border: "1px solid #1e293b", borderRadius: 4, textAlign: "center" }}>
-            <div style={{ fontSize: 9, color: "#334155", letterSpacing: "0.12em", marginBottom: 6 }}>{s.label}</div>
-            <div style={{ fontSize: 20, color: s.color, fontWeight: 700 }}>{s.value}</div>
-          </div>
-        ))}
-      </div>
-
-      <div style={{ marginBottom: 8 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#475569", marginBottom: 6 }}>
-          <span>Daily spend</span>
-          <span style={{ color: dailySpend >= dailyLimit ? "#f87171" : "#94a3b8" }}>${dailySpend} / ${dailyLimit}</span>
-        </div>
-        <div style={{ height: 4, background: "#1e293b", borderRadius: 2, overflow: "hidden", marginBottom: 20 }}>
-          <div style={{ width: `${Math.min((dailySpend / dailyLimit) * 100, 100)}%`, height: "100%", background: dailySpend >= dailyLimit ? "#f87171" : "#4ade80", transition: "width 0.4s ease" }} />
-        </div>
-      </div>
-
-      {betsPlaced.length > 0 && (
-        <div style={{ marginBottom: 20 }}>
-          <div style={{ fontSize: 10, color: "#4ade80", letterSpacing: "0.12em", marginBottom: 12 }}>RECENT AUTO-BETS</div>
-          {betsPlaced.slice(0, 5).map((entry, i) => (
-            <div key={i} style={{ padding: "12px 16px", marginBottom: 8, background: "#0a1a0f", border: "1px solid #4ade8022", borderLeft: "3px solid #4ade80", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div>
-                <div style={{ fontSize: 12, color: "#e2e8f0", marginBottom: 3 }}>{entry.data?.market}</div>
-                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                  <span style={{ fontSize: 11, color: "#4ade8099" }}>BUY {entry.data?.side} · {entry.data?.strategy}</span>
-                  <span style={{ fontSize: 10, padding: "1px 5px", borderRadius: 2, background: "#4ade8022", color: "#4ade80" }}>{entry.data?.qualityLabel}</span>
-                </div>
-              </div>
-              <div style={{ textAlign: "right" }}>
-                <div style={{ fontSize: 14, color: "#4ade80", fontWeight: 600 }}>${entry.data?.amount}</div>
-                <div style={{ fontSize: 10, color: "#334155" }}>{timeAgo(entry.timestamp)}</div>
-              </div>
-            </div>
-          ))}
-        </div>
-      )}
-
-      <div>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-          <div style={{ fontSize: 10, color: "#334155", letterSpacing: "0.12em" }}>FULL ACTIVITY LOG</div>
-          <button onClick={fetchLog} style={{ background: "transparent", border: "1px solid #1e293b", color: "#475569", padding: "4px 10px", fontFamily: "inherit", fontSize: 10, cursor: "pointer", borderRadius: 2 }}>↻ refresh</button>
-        </div>
-        {loading ? (
-          <div style={{ textAlign: "center", padding: "24px", color: "#334155", fontSize: 12 }}>Loading...</div>
-        ) : log.length === 0 ? (
-          <div style={{ textAlign: "center", padding: "24px", color: "#334155", fontSize: 12 }}>No activity yet — first scan runs 10 seconds after deploy</div>
-        ) : (
-          <div style={{ maxHeight: 400, overflowY: "auto" }}>
-            {log.map((entry, i) => (
-              <div key={i} style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "8px 12px", borderBottom: "1px solid #0a0f18" }}>
-                <div style={{ fontSize: 10, color: "#334155", whiteSpace: "nowrap", marginTop: 1 }}>{timeAgo(entry.timestamp)}</div>
-                <div style={{ width: 80, fontSize: 10, color: LOG_COLORS[entry.type] || "#475569", flexShrink: 0 }}>{entry.type}</div>
-                <div style={{ fontSize: 11, color: entry.type === "BET_PLACED" ? "#e2e8f0" : "#475569", lineHeight: 1.5 }}>{entry.message}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function EdgeExplainer() {
-  const [example, setExample] = useState(0);
-  const examples = [
-    { label: "NOAA Weather", modelProb: 72, kalshiProb: 58, edge: 14, side: "YES", color: "#a78bfa", description: "NOAA's ensemble model shows 72% precipitation probability. Kalshi crowd prices it at 58¢. You buy YES at 58¢ when the real probability is 72% — a 14-point edge." },
-    { label: "Fed Rate Hold", modelProb: 81, kalshiProb: 72, edge: 9, side: "YES", color: "#38bdf8", description: "CME futures imply 81% chance Fed holds rates. Kalshi prices it at 72¢. You buy YES at 72¢ when the real probability is 81% — a 9-point edge." },
-    { label: "Mispricing", modelProb: 55, kalshiProb: 42, edge: 13, side: "YES", color: "#4ade80", description: "YES + NO bids only sum to 88¢ instead of 100¢. The market is mispriced. Buying YES at 42¢ when fair value is ~55¢ captures the 13-point gap." },
-  ];
-  const ex = examples[example];
-  return (
-    <div style={{ animation: "fadeIn 0.3s ease" }}>
-      <div style={{ padding: "20px 24px", background: "#0a0f18", border: "1px solid #1e293b", borderRadius: 4, marginBottom: 20 }}>
-        <div style={{ fontSize: 10, color: "#334155", letterSpacing: "0.15em", marginBottom: 12 }}>THE CORE CONCEPT</div>
-        <div style={{ fontSize: 15, color: "#e2e8f0", lineHeight: 1.8, marginBottom: 16 }}>
-          Kalshi prices work like probabilities — a market at <span style={{ color: "#38bdf8" }}>58¢</span> means the crowd thinks there's a <span style={{ color: "#38bdf8" }}>58% chance</span> it happens. Your edge is the gap between what your <span style={{ color: "#4ade80" }}>data source</span> says vs. what <span style={{ color: "#94a3b8" }}>Kalshi's crowd</span> believes.
-        </div>
-        <div style={{ padding: "14px 16px", background: "#060c14", border: "1px solid #38bdf844", borderRadius: 3 }}>
-          <div style={{ fontSize: 12, color: "#38bdf8", fontWeight: 600, marginBottom: 6 }}>EDGE FORMULA</div>
-          <div style={{ fontSize: 13, color: "#e2e8f0", fontFamily: "monospace" }}>Edge = Model Probability − Kalshi Price</div>
-          <div style={{ fontSize: 11, color: "#475569", marginTop: 6 }}>If Edge {">"} 0 → buy YES &nbsp;|&nbsp; If Edge {"<"} 0 → buy NO</div>
-        </div>
-      </div>
-      <div style={{ marginBottom: 20 }}>
-        <div style={{ fontSize: 10, color: "#334155", letterSpacing: "0.15em", marginBottom: 12 }}>LIVE EXAMPLES</div>
-        <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-          {examples.map((e, i) => (
-            <button key={i} onClick={() => setExample(i)} style={{ background: example === i ? e.color : "transparent", border: `1px solid ${example === i ? e.color : "#1e293b"}`, color: example === i ? "#060c14" : "#475569", padding: "6px 14px", fontFamily: "inherit", fontSize: 11, cursor: "pointer", borderRadius: 2, fontWeight: example === i ? 600 : 400 }}>{e.label}</button>
-          ))}
-        </div>
-        <div style={{ padding: "20px 24px", background: "#0a0f18", border: `1px solid ${ex.color}33`, borderLeft: `3px solid ${ex.color}`, borderRadius: 4 }}>
-          <div style={{ marginBottom: 20 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#475569", marginBottom: 8 }}><span>0¢</span><span>25¢</span><span>50¢</span><span>75¢</span><span>100¢</span></div>
-            <div style={{ position: "relative", height: 32, background: "#060c14", borderRadius: 3, border: "1px solid #1e293b" }}>
-              <div style={{ position: "absolute", left: `${ex.kalshiProb}%`, top: 0, bottom: 0, width: 2, background: "#475569" }}>
-                <div style={{ position: "absolute", top: -20, left: -20, fontSize: 10, color: "#475569", whiteSpace: "nowrap" }}>KALSHI {ex.kalshiProb}¢</div>
-              </div>
-              <div style={{ position: "absolute", left: `${ex.modelProb}%`, top: 0, bottom: 0, width: 2, background: ex.color }}>
-                <div style={{ position: "absolute", top: -20, left: -20, fontSize: 10, color: ex.color, whiteSpace: "nowrap" }}>MODEL {ex.modelProb}¢</div>
-              </div>
-              <div style={{ position: "absolute", left: `${Math.min(ex.kalshiProb, ex.modelProb)}%`, width: `${Math.abs(ex.modelProb - ex.kalshiProb)}%`, top: 4, bottom: 4, background: `${ex.color}44`, borderRadius: 2 }} />
-            </div>
-            <div style={{ textAlign: "center", marginTop: 16 }}>
-              <span style={{ fontSize: 11, color: "#475569" }}>Edge gap: </span>
-              <span style={{ fontSize: 18, color: ex.color, fontWeight: 700 }}>+{ex.edge} points</span>
-              <span style={{ fontSize: 11, color: "#475569", marginLeft: 8 }}>→ buy {ex.side} at {ex.kalshiProb}¢</span>
-            </div>
-          </div>
-          <div style={{ fontSize: 12, color: "#94a3b8", lineHeight: 1.7 }}>{ex.description}</div>
-        </div>
-      </div>
-      <div style={{ padding: "16px 20px", background: "#0a0f18", border: "1px solid #facc1522", borderRadius: 4 }}>
-        <div style={{ fontSize: 10, color: "#facc15", letterSpacing: "0.15em", marginBottom: 10 }}>⚠ IMPORTANT</div>
-        <div style={{ fontSize: 12, color: "#94a3b8", lineHeight: 1.8 }}>Edge means you have a statistical advantage over time — not that any individual bet will win. Never bet more than you can afford to lose.</div>
-      </div>
-    </div>
-  );
-}
-
-function ProbCompare({ modelProb, kalshiProb, side }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11 }}>
-      <div style={{ textAlign: "center" }}>
-        <div style={{ color: "#94a3b8", marginBottom: 2 }}>MODEL</div>
-        <div style={{ color: "#e2e8f0", fontWeight: 600, fontSize: 15 }}>{Math.round(modelProb * 100)}c</div>
-      </div>
-      <div style={{ flex: 1 }}>
-        <div style={{ position: "relative", height: 6, background: "#1e293b", borderRadius: 3 }}>
-          <div style={{ position: "absolute", left: `${Math.min(modelProb, kalshiProb) * 100}%`, width: `${Math.abs(modelProb - kalshiProb) * 100}%`, height: "100%", background: side === "YES" ? "#38bdf8" : "#fb923c", borderRadius: 3, opacity: 0.8 }} />
-          <div style={{ position: "absolute", left: `${kalshiProb * 100}%`, transform: "translateX(-50%)", width: 2, height: "100%", background: "#94a3b8" }} />
-          <div style={{ position: "absolute", left: `${modelProb * 100}%`, transform: "translateX(-50%)", width: 2, height: "100%", background: "#e2e8f0" }} />
-        </div>
-        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 3, color: "#475569", fontSize: 10 }}>
-          <span>0</span><span>50</span><span>100</span>
-        </div>
-      </div>
-      <div style={{ textAlign: "center" }}>
-        <div style={{ color: "#94a3b8", marginBottom: 2 }}>KALSHI</div>
-        <div style={{ color: "#94a3b8", fontWeight: 600, fontSize: 15 }}>{Math.round(kalshiProb * 100)}c</div>
-      </div>
-    </div>
-  );
-}
-
-function BetCard({ bet, onApprove, onReject }) {
-  const [size, setSize] = useState(bet.recommendedSize || 25);
-  const [expanded, setExpanded] = useState(false);
-  const catColor = CATEGORY_COLOR[bet.category] || "#38bdf8";
-  const qColor = QUALITY_COLOR(bet.qualityScore || 0);
-  return (
-    <div style={{ background: "linear-gradient(135deg, #0f172a 0%, #0c1220 100%)", border: `1px solid ${catColor}33`, borderLeft: `3px solid ${catColor}`, borderRadius: 4, marginBottom: 12, overflow: "hidden" }}>
-      <div style={{ padding: "14px 16px", cursor: "pointer" }} onClick={() => setExpanded(!expanded)}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8 }}>
-          <div style={{ flex: 1 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 5 }}>
-              <span style={{ color: catColor, fontSize: 11, letterSpacing: "0.1em" }}>{CATEGORY_ICON[bet.category] || "◆"} {bet.strategy.toUpperCase()}</span>
-              <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 2, background: `${CONFIDENCE_COLOR[bet.confidence] || "#facc15"}22`, color: CONFIDENCE_COLOR[bet.confidence] || "#facc15", border: `1px solid ${CONFIDENCE_COLOR[bet.confidence] || "#facc15"}44` }}>{bet.confidence}</span>
-              <span style={{ fontSize: 10, color: "#475569" }}>{timeAgo(bet.timestamp)}</span>
-            </div>
-            <div style={{ fontSize: 14, color: "#e2e8f0", fontWeight: 500, lineHeight: 1.4 }}>{bet.market}</div>
-          </div>
-          <div style={{ textAlign: "right", marginLeft: 16, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-            <div style={{ display: "inline-block", padding: "3px 10px", borderRadius: 2, background: bet.side === "YES" ? "#0d2d1a" : "#2d0d0d", border: `1px solid ${bet.side === "YES" ? "#4ade8044" : "#f8717144"}`, color: bet.side === "YES" ? "#4ade80" : "#f87171", fontSize: 12, fontWeight: 700 }}>BUY {bet.side}</div>
-            <div style={{ fontSize: 11, color: "#475569" }}>expires {bet.expiresIn}</div>
-          </div>
-        </div>
-        <ProbCompare modelProb={bet.modelProb} kalshiProb={bet.kalshiProb} side={bet.side} />
-        <div style={{ display: "flex", gap: 16, marginTop: 10, alignItems: "center" }}>
-          <div>
-            <div style={{ fontSize: 10, color: "#475569" }}>EDGE</div>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <div style={{ fontSize: 13, color: CONFIDENCE_COLOR[bet.confidence] || "#facc15", fontWeight: 600 }}>+{Math.round(bet.yourEdge * 100)}pts</div>
-              <div style={{ height: 4, width: 50, background: "#1e293b", borderRadius: 2, overflow: "hidden" }}>
-                <div style={{ width: `${Math.min(bet.yourEdge * 500, 100)}%`, height: "100%", background: CONFIDENCE_COLOR[bet.confidence] || "#facc15" }} />
-              </div>
-            </div>
-          </div>
-          {bet.qualityScore !== undefined && (
-            <div>
-              <div style={{ fontSize: 10, color: "#475569" }}>QUALITY</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
-                <div style={{ fontSize: 15, fontWeight: 700, color: qColor }}>{bet.qualityLabel}</div>
-                <div style={{ fontSize: 10, color: "#334155" }}>{bet.qualityScore}/100</div>
-              </div>
-            </div>
-          )}
-          <div><div style={{ fontSize: 10, color: "#475569" }}>SIZE</div><div style={{ fontSize: 13, color: "#e2e8f0", fontWeight: 600 }}>${size}</div></div>
-          <div><div style={{ fontSize: 10, color: "#475569" }}>SOURCE</div><div style={{ fontSize: 11, color: "#94a3b8" }}>{bet.dataSource}</div></div>
-          <div style={{ marginLeft: "auto", fontSize: 10, color: "#475569" }}>{expanded ? "▲ less" : "▼ more"}</div>
-        </div>
-      </div>
-      {expanded && (
-        <div style={{ padding: "0 16px 14px", borderTop: "1px solid #1e293b" }}>
-          <div style={{ paddingTop: 12, fontSize: 12, color: "#94a3b8", lineHeight: 1.7, marginBottom: 12 }}>💡 {bet.reasoning}</div>
-          {bet.qualityScore !== undefined && (
-            <div style={{ marginBottom: 12, padding: "10px 14px", background: "#060c14", border: `1px solid ${qColor}33`, borderRadius: 3 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                <div style={{ fontSize: 10, color: "#475569" }}>SIGNAL QUALITY</div>
-                <div style={{ fontSize: 14, fontWeight: 700, color: qColor }}>{bet.qualityLabel} — {bet.qualityScore}/100</div>
-              </div>
-              <div style={{ height: 4, background: "#1e293b", borderRadius: 2, overflow: "hidden" }}>
-                <div style={{ width: `${bet.qualityScore}%`, height: "100%", background: qColor, transition: "width 0.6s ease" }} />
-              </div>
-            </div>
-          )}
-          <div style={{ marginBottom: 14 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#94a3b8", marginBottom: 6 }}>
-              <span>Bet size</span>
-              <span style={{ color: "#e2e8f0" }}>${size} <span style={{ color: "#475569" }}>(Kelly rec: ${bet.recommendedSize})</span></span>
-            </div>
-            <input type="range" min={5} max={bet.maxSize || 100} value={size} onChange={e => setSize(Number(e.target.value))} style={{ width: "100%", accentColor: catColor, cursor: "pointer" }} />
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#334155", marginTop: 2 }}><span>$5 min</span><span>${bet.maxSize || 100} max</span></div>
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, padding: "10px 12px", background: "#0a0f1a", border: "1px solid #1e293b", borderRadius: 3 }}>
-            <div><div style={{ fontSize: 10, color: "#475569", marginBottom: 2 }}>IF WIN</div><div style={{ fontSize: 14, color: "#4ade80", fontWeight: 600 }}>+${Math.round(size * (1 / (bet.side === "YES" ? bet.kalshiProb : 1 - bet.kalshiProb) - 1))}</div></div>
-            <div><div style={{ fontSize: 10, color: "#475569", marginBottom: 2 }}>IF LOSE</div><div style={{ fontSize: 14, color: "#f87171", fontWeight: 600 }}>-${size}</div></div>
-          </div>
-        </div>
-      )}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", borderTop: "1px solid #1e293b" }}>
-        <button onClick={() => onReject(bet.id)} style={{ background: "transparent", border: "none", borderRight: "1px solid #1e293b", color: "#475569", padding: "11px", cursor: "pointer", fontFamily: "inherit", fontSize: 12 }}
-          onMouseEnter={e => { e.target.style.background = "#1e0808"; e.target.style.color = "#f87171"; }}
-          onMouseLeave={e => { e.target.style.background = "transparent"; e.target.style.color = "#475569"; }}>✕ SKIP</button>
-        <button onClick={() => onApprove(bet.id, size)} style={{ background: "transparent", border: "none", color: "#38bdf8", padding: "11px", cursor: "pointer", fontFamily: "inherit", fontSize: 12, fontWeight: 600 }}
-          onMouseEnter={e => { e.target.style.background = "#051a2e"; e.target.style.color = "#7dd3fc"; }}
-          onMouseLeave={e => { e.target.style.background = "transparent"; e.target.style.color = "#38bdf8"; }}>✓ CONFIRM BET — ${size}</button>
-      </div>
-    </div>
-  );
-}
-
-export default function KalshiBot() {
-  const [bets, setBets] = useState([]);
-  const [approved, setApproved] = useState([]);
-  const [rejected, setRejected] = useState([]);
-  const [activeTab, setActiveTab] = useState("queue");
-  const [toast, setToast] = useState(null);
-  const [filter, setFilter] = useState("all");
-  const [scanning, setScanning] = useState(false);
-  const [error, setError] = useState(null);
-
-  const showToast = (msg, type = "success") => {
-    setToast({ msg, type });
-    setTimeout(() => setToast(null), 3000);
-  };
-
-  const handleScan = async () => {
-    setScanning(true); setError(null);
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/signals`);
-      const data = await res.json();
-      if (data.signals && data.signals.length > 0) {
-        setBets(data.signals);
-        showToast(`Found ${data.signals.length} signal${data.signals.length !== 1 ? "s" : ""}!`, "success");
-      } else {
-        showToast("No signals found right now", "neutral");
+      const pointRes = await fetch("https://api.weather.gov/points/40.7128,-74.0060");
+      const pointData = await pointRes.json();
+      if (!pointData.properties) continue;
+      const forecastRes = await fetch(pointData.properties.forecast);
+      const forecastData = await forecastRes.json();
+      if (!forecastData.properties) continue;
+      const pop = forecastData.properties.periods[0]?.probabilityOfPrecipitation?.value;
+      if (pop === null || pop === undefined) continue;
+      const noaaProb = pop / 100;
+      const kalshiProb = market.yes_ask / 100;
+      const edge = noaaProb - kalshiProb;
+      if (Math.abs(edge) > 0.07) {
+        const expiresIn = market.close_time ? new Date(market.close_time).toLocaleDateString() : "soon";
+        const confidence = Math.abs(edge) > 0.12 ? "High" : "Medium";
+        const dataSource = "NOAA Weather API (free)";
+        const qs = calcQualityScore(Math.abs(edge), dataSource, expiresIn, confidence);
+        signals.push({
+          id: `noaa_${market.ticker}`, strategy: "NOAA Weather Model", category: "weather",
+          market: market.title, ticker: market.ticker,
+          side: edge > 0 ? "YES" : "NO",
+          yourEdge: parseFloat(Math.abs(edge).toFixed(2)),
+          modelProb: parseFloat(noaaProb.toFixed(2)),
+          kalshiProb: parseFloat(kalshiProb.toFixed(2)),
+          recommendedSize: Math.min(75, Math.round(Math.abs(edge) * 300)), maxSize: 100,
+          dataSource, reasoning: `NOAA gives ${Math.round(noaaProb * 100)}% precipitation probability. Kalshi prices it at ${Math.round(kalshiProb * 100)}c. Edge: ${Math.round(Math.abs(edge) * 100)} points.`,
+          confidence, expiresIn, qualityScore: qs, qualityLabel: getQualityLabel(qs), timestamp: Date.now(),
+        });
       }
-    } catch (e) {
-      setError("Could not reach backend: " + e.message);
-    }
-    setScanning(false);
-  };
-
-  const handleApprove = async (id, size) => {
-    const bet = bets.find(b => b.id === id);
-    try {
-      const res = await fetch(`${BACKEND_URL}/api/bet`, {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ticker: bet.ticker, side: bet.side.toLowerCase(), dollarAmount: size }),
-      });
-      const data = await res.json();
-      if (data.success) {
-        setApproved(prev => [...prev, { ...bet, finalSize: size, approvedAt: Date.now() }]);
-        setBets(prev => prev.filter(b => b.id !== id));
-        showToast(`✓ Bet placed: ${bet.side} $${size}`, "success");
-      } else {
-        showToast(`Bet failed: ${data.error}`, "neutral");
-      }
-    } catch (e) {
-      showToast("Could not place bet: " + e.message, "neutral");
-    }
-  };
-
-  const handleReject = (id) => {
-    const bet = bets.find(b => b.id === id);
-    setRejected(prev => [...prev, { ...bet, rejectedAt: Date.now() }]);
-    setBets(prev => prev.filter(b => b.id !== id));
-    showToast("Skipped", "neutral");
-  };
-
-  const filteredBets = filter === "all" ? bets : bets.filter(b => b.category === filter);
-  const totalApprovedValue = approved.reduce((s, b) => s + b.finalSize, 0);
-
-  return (
-    <div style={{ fontFamily: "'IBM Plex Mono', 'Courier New', monospace", background: "#060c14", color: "#94a3b8", minHeight: "100vh" }}>
-      <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@600;700&display=swap');
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
-        @keyframes slideIn { from{transform:translateX(100%);opacity:0} to{transform:translateX(0);opacity:1} }
-        @keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
-        @keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
-        .tab-btn { background:transparent; border:none; color:#475569; padding:10px 0; margin-right:24px; font-family:inherit; font-size:12px; letter-spacing:0.08em; cursor:pointer; border-bottom:2px solid transparent; transition:all 0.15s; }
-        .tab-btn:hover { color:#94a3b8; }
-        .tab-btn.active { color:#38bdf8; border-bottom-color:#38bdf8; }
-        .filter-btn { background:transparent; border:1px solid #1e293b; padding:5px 12px; font-family:inherit; font-size:11px; cursor:pointer; transition:all 0.15s; border-radius:2px; color:#475569; }
-        .filter-btn.active { color:#060c14; font-weight:600; }
-      `}</style>
-
-      {toast && (
-        <div style={{ position: "fixed", top: 20, right: 20, zIndex: 999, padding: "10px 18px", background: toast.type === "success" ? "#0d2d1a" : "#0f172a", border: `1px solid ${toast.type === "success" ? "#4ade8066" : "#334155"}`, color: toast.type === "success" ? "#4ade80" : "#94a3b8", fontSize: 12, fontFamily: "inherit", borderRadius: 3, animation: "slideIn 0.25s ease" }}>
-          {toast.msg}
-        </div>
-      )}
-
-      <div style={{ borderBottom: "1px solid #0f1e30", padding: "16px 28px", display: "flex", alignItems: "center", justifyContent: "space-between", background: "#07101a" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 20 }}>
-          <div>
-            <div style={{ fontSize: 9, color: "#1e4d7b", letterSpacing: "0.2em", marginBottom: 1 }}>KALSHI</div>
-            <div style={{ fontFamily: "'Syne', sans-serif", fontSize: 18, color: "#e2e8f0", fontWeight: 700 }}>Signal Bot</div>
-          </div>
-          <div style={{ width: 1, height: 32, background: "#0f1e30" }} />
-          <div style={{ display: "flex", gap: 20 }}>
-            {[
-              { label: "PENDING", value: bets.length, color: "#38bdf8" },
-              { label: "PLACED", value: approved.length, color: "#4ade80" },
-              { label: "SKIPPED", value: rejected.length, color: "#475569" },
-              { label: "DEPLOYED", value: `$${totalApprovedValue}`, color: "#facc15" },
-            ].map(stat => (
-              <div key={stat.label}>
-                <div style={{ fontSize: 9, color: "#334155", letterSpacing: "0.12em" }}>{stat.label}</div>
-                <div style={{ fontSize: 16, color: stat.color, fontWeight: 600 }}>{stat.value}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-        <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#1e4d7b" }}>
-            <div style={{ width: 6, height: 6, borderRadius: "50%", background: "#38bdf8", animation: "pulse 2s infinite" }} />
-            LIVE
-          </div>
-          <button onClick={handleScan} style={{ background: scanning ? "#0a1a2e" : "transparent", border: "1px solid #1e4d7b", color: "#38bdf8", padding: "7px 16px", fontFamily: "inherit", fontSize: 11, cursor: "pointer", letterSpacing: "0.08em", borderRadius: 2 }}>
-            {scanning ? <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ display: "inline-block", animation: "spin 0.8s linear infinite" }}>◌</span> SCANNING...</span> : "⟳ SCAN FOR SIGNALS"}
-          </button>
-        </div>
-      </div>
-
-      <div style={{ borderBottom: "1px solid #0f1e30", padding: "0 28px", background: "#07101a" }}>
-        <button className={`tab-btn${activeTab === "queue" ? " active" : ""}`} onClick={() => setActiveTab("queue")}>
-          SIGNAL QUEUE {bets.length > 0 && <span style={{ color: "#38bdf8", marginLeft: 4 }}>({bets.length})</span>}
-        </button>
-        <button className={`tab-btn${activeTab === "auto" ? " active" : ""}`} onClick={() => setActiveTab("auto")}>
-          AUTO-TRADE <span style={{ marginLeft: 4, fontSize: 9, color: "#4ade80" }}>● LIVE</span>
-        </button>
-        <button className={`tab-btn${activeTab === "history" ? " active" : ""}`} onClick={() => setActiveTab("history")}>HISTORY</button>
-        <button className={`tab-btn${activeTab === "edge" ? " active" : ""}`} onClick={() => setActiveTab("edge")}>HOW EDGE WORKS</button>
-      </div>
-
-      <div style={{ padding: "20px 28px", maxWidth: 800 }}>
-        {error && (
-          <div style={{ padding: "12px 16px", marginBottom: 16, background: "#1a0808", border: "1px solid #f8717144", color: "#f87171", fontSize: 12, borderRadius: 3 }}>⚠ {error}</div>
-        )}
-
-        {activeTab === "queue" && (
-          <div style={{ animation: "fadeIn 0.3s ease" }}>
-            <div style={{ display: "flex", gap: 8, marginBottom: 18, alignItems: "center" }}>
-              <span style={{ fontSize: 10, color: "#334155", marginRight: 4 }}>FILTER</span>
-              {["all", "weather", "economic", "sports", "political"].map(cat => (
-                <button key={cat} className={`filter-btn${filter === cat ? " active" : ""}`}
-                  style={filter === cat ? { background: CATEGORY_COLOR[cat] || "#38bdf8", borderColor: CATEGORY_COLOR[cat] || "#38bdf8" } : {}}
-                  onClick={() => setFilter(cat)}>
-                  {cat === "all" ? "ALL" : `${CATEGORY_ICON[cat]} ${cat.toUpperCase()}`}
-                </button>
-              ))}
-            </div>
-            {filteredBets.length === 0 ? (
-              <div style={{ padding: "60px 0", textAlign: "center" }}>
-                <div style={{ fontSize: 32, marginBottom: 12, color: "#1e293b" }}>◌</div>
-                <div style={{ fontSize: 13, color: "#334155", marginBottom: 8 }}>No signals yet</div>
-                <div style={{ fontSize: 11, color: "#1e293b", marginBottom: 16 }}>Click Scan or check the Auto-Trade tab to see what the bot has been doing</div>
-              </div>
-            ) : (
-              filteredBets.map(bet => <BetCard key={bet.id} bet={bet} onApprove={handleApprove} onReject={handleReject} />)
-            )}
-          </div>
-        )}
-
-        {activeTab === "auto" && <AutoTradePanel />}
-
-        {activeTab === "history" && (
-          <div style={{ animation: "fadeIn 0.3s ease" }}>
-            {approved.length === 0 && rejected.length === 0 ? (
-              <div style={{ padding: "48px 0", textAlign: "center", color: "#334155", fontSize: 13 }}>No manual bet history yet.</div>
-            ) : (
-              <>
-                {approved.length > 0 && (
-                  <div style={{ marginBottom: 24 }}>
-                    <div style={{ fontSize: 10, color: "#4ade80", letterSpacing: "0.12em", marginBottom: 12 }}>CONFIRMED BETS</div>
-                    {approved.map(b => (
-                      <div key={b.id} style={{ padding: "12px 16px", marginBottom: 8, background: "#0a1a0f", border: "1px solid #4ade8022", borderLeft: "3px solid #4ade80", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                        <div>
-                          <div style={{ fontSize: 12, color: "#e2e8f0", marginBottom: 3 }}>{b.market}</div>
-                          <div style={{ fontSize: 11, color: "#4ade8099" }}>BUY {b.side} · {b.strategy}</div>
-                        </div>
-                        <div style={{ textAlign: "right" }}>
-                          <div style={{ fontSize: 14, color: "#4ade80", fontWeight: 600 }}>${b.finalSize}</div>
-                          <div style={{ fontSize: 10, color: "#334155" }}>{timeAgo(b.approvedAt)}</div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {rejected.length > 0 && (
-                  <div>
-                    <div style={{ fontSize: 10, color: "#475569", letterSpacing: "0.12em", marginBottom: 12 }}>SKIPPED</div>
-                    {rejected.map(b => (
-                      <div key={b.id} style={{ padding: "12px 16px", marginBottom: 8, background: "#0a0f14", border: "1px solid #1e293b", borderLeft: "3px solid #1e293b", display: "flex", justifyContent: "space-between", opacity: 0.6 }}>
-                        <div>
-                          <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 3 }}>{b.market}</div>
-                          <div style={{ fontSize: 11, color: "#334155" }}>{b.strategy}</div>
-                        </div>
-                        <div style={{ fontSize: 10, color: "#334155" }}>{timeAgo(b.rejectedAt)}</div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        )}
-
-        {activeTab === "edge" && <EdgeExplainer />}
-      </div>
-    </div>
-  );
+    } catch (e) { console.error("NOAA error:", e.message); }
+  }
+  return signals;
 }
+
+async function getFedSignals(markets) {
+  const signals = [];
+  const fedMarkets = markets.filter(m =>
+    m.title.toLowerCase().includes("fed") || m.title.toLowerCase().includes("fomc") ||
+    m.title.toLowerCase().includes("interest rate") || m.title.toLowerCase().includes("federal funds")
+  );
+  if (fedMarkets.length === 0) return signals;
+  try {
+    const fredRes = await fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=FEDTARMD&api_key=${process.env.FRED_API_KEY}&sort_order=desc&limit=1&file_type=json`);
+    const fredData = await fredRes.json();
+    const currentRate = parseFloat(fredData.observations?.[0]?.value);
+    if (isNaN(currentRate)) return signals;
+    for (const market of fedMarkets.slice(0, 5)) {
+      const kalshiProb = market.yes_ask / 100;
+      const isHold = market.title.toLowerCase().includes("hold") || market.title.toLowerCase().includes("unchanged") || market.title.toLowerCase().includes("pause");
+      const modelProb = isHold ? 0.75 : 0.35;
+      const edge = modelProb - kalshiProb;
+      if (Math.abs(edge) > 0.05) {
+        const expiresIn = market.close_time ? new Date(market.close_time).toLocaleDateString() : "soon";
+        const confidence = Math.abs(edge) > 0.08 ? "High" : "Medium";
+        const dataSource = "FRED (St. Louis Fed)";
+        const qs = calcQualityScore(Math.abs(edge), dataSource, expiresIn, confidence);
+        signals.push({
+          id: `fed_${market.ticker}`, strategy: "Fed Rate Tracker", category: "economic",
+          market: market.title, ticker: market.ticker,
+          side: edge > 0 ? "YES" : "NO",
+          yourEdge: parseFloat(Math.abs(edge).toFixed(2)),
+          modelProb: parseFloat(modelProb.toFixed(2)),
+          kalshiProb: parseFloat(kalshiProb.toFixed(2)),
+          recommendedSize: Math.min(100, Math.round(Math.abs(edge) * 400)), maxSize: 150,
+          dataSource, reasoning: `Current Fed funds rate: ${currentRate}%. Model probability: ${Math.round(modelProb * 100)}%. Kalshi: ${Math.round(kalshiProb * 100)}c. Edge: ${Math.round(Math.abs(edge) * 100)} points.`,
+          confidence, expiresIn, qualityScore: qs, qualityLabel: getQualityLabel(qs), timestamp: Date.now(),
+        });
+      }
+    }
+  } catch (e) { console.error("Fed strategy error:", e.message); }
+  return signals;
+}
+
+async function placeBet(ticker, side, dollarAmount) {
+  const mktPath = `/trade-api/v2/markets/${ticker}`;
+  const mktRes = await fetch(`https://api.elections.kalshi.com${mktPath}`, { headers: authHeaders("GET", mktPath) });
+  const mktData = await mktRes.json();
+  if (!mktData.market) throw new Error("Market not found");
+  const market = mktData.market;
+  const price = side === "yes" ? market.yes_ask : market.no_ask;
+  if (!price || price <= 0) throw new Error(`Invalid price: ${price}`);
+  const contracts = Math.max(1, Math.floor((dollarAmount * 100) / price));
+  const orderPath = `/trade-api/v2/portfolio/orders`;
+  const orderRes = await fetch(`https://api.elections.kalshi.com${orderPath}`, {
+    method: "POST",
+    headers: authHeaders("POST", orderPath),
+    body: JSON.stringify({
+      ticker, action: "buy", side: side.toLowerCase(), count: contracts, type: "limit",
+      yes_price: side === "yes" ? price : 100 - price,
+      client_order_id: `auto_${Date.now()}`,
+    }),
+  });
+  const order = await orderRes.json();
+  if (order.error) throw new Error(order.error.message || JSON.stringify(order.error));
+  return { order, contracts, price };
+}
+
+async function runAutoTrade() {
+  if (!autoTradeEnabled) return;
+  logActivity("SCAN", "Auto-scan started");
+  try {
+    const { markets } = await getMarkets(100);
+    if (!markets) { logActivity("ERROR", "No markets returned"); return; }
+    const [mispricing, noaa, fed] = await Promise.all([
+      Promise.resolve(getMispricingSignals(markets)),
+      getNOAASignals(markets),
+      getFedSignals(markets),
+    ]);
+    const allSignals = [...mispricing, ...noaa, ...fed]
+      .filter(s => s.qualityScore >= 65)
+      .filter(s => !placedTickers.has(s.ticker))
+      .sort((a, b) => b.qualityScore - a.qualityScore);
+    logActivity("SCAN", `Found ${allSignals.length} qualifying signals (A or above)`);
+    for (const signal of allSignals.slice(0, 3)) {
+      const dailySpend = getDailySpend();
+      if (dailySpend >= DAILY_LIMIT) {
+        logActivity("LIMIT", `Daily limit of $${DAILY_LIMIT} reached ($${dailySpend} spent today) — pausing until midnight`);
+        break;
+      }
+      try {
+        const result = await placeBet(signal.ticker, signal.side.toLowerCase(), 5);
+        placedTickers.add(signal.ticker);
+        logActivity("BET_PLACED", `Auto-placed $5 ${signal.side} on "${signal.market}"`, {
+          ticker: signal.ticker, strategy: signal.strategy,
+          qualityScore: signal.qualityScore, qualityLabel: signal.qualityLabel,
+          edge: signal.yourEdge, contracts: result.contracts, price: result.price,
+          market: signal.market, side: signal.side, amount: 5,
+        });
+        await new Promise(r => setTimeout(r, 1000));
+      } catch (e) {
+        logActivity("BET_FAILED", `Failed to place bet on "${signal.market}": ${e.message}`, { ticker: signal.ticker });
+      }
+    }
+    if (allSignals.length === 0) logActivity("SCAN", "No qualifying signals found this scan");
+  } catch (e) {
+    logActivity("ERROR", `Auto-trade error: ${e.message}`);
+  }
+}
+
+setInterval(runAutoTrade, 15 * 60 * 1000);
+setTimeout(runAutoTrade, 10000);
+
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "ok",
+    loggedIn: !!process.env.KALSHI_KEY_ID && !!process.env.KALSHI_PRIVATE_KEY,
+    hasKeyId: !!process.env.KALSHI_KEY_ID,
+    hasPrivateKey: !!process.env.KALSHI_PRIVATE_KEY,
+    hasFred: !!process.env.FRED_API_KEY,
+    autoTradeEnabled,
+    dailySpend: getDailySpend(),
+    dailyLimit: DAILY_LIMIT,
+  });
+});
+
+app.get("/api/signals", async (req, res) => {
+  try {
+    const { markets } = await getMarkets(100);
+    if (!markets) return res.json({ signals: [] });
+    const [mispricing, noaa, fed] = await Promise.all([
+      Promise.resolve(getMispricingSignals(markets)),
+      getNOAASignals(markets),
+      getFedSignals(markets),
+    ]);
+    const signals = [...mispricing, ...noaa, ...fed].sort((a, b) => b.qualityScore - a.qualityScore);
+    console.log(`Signals — mispricing: ${mispricing.length}, noaa: ${noaa.length}, fed: ${fed.length}`);
+    res.json({ signals });
+  } catch (e) {
+    console.error("Signals error:", e.message);
+    res.json({ signals: [], error: e.message });
+  }
+});
+
+app.get("/api/autotrade/log", (req, res) => {
+  res.json({ enabled: autoTradeEnabled, dailySpend: getDailySpend(), dailyLimit: DAILY_LIMIT, log: autoTradeLog });
+});
+
+app.post("/api/autotrade/toggle", (req, res) => {
+  autoTradeEnabled = !autoTradeEnabled;
+  logActivity(autoTradeEnabled ? "ENABLED" : "DISABLED", `Auto-trading ${autoTradeEnabled ? "enabled" : "disabled"}`);
+  res.json({ enabled: autoTradeEnabled });
+});
+
+app.post("/api/bet", async (req, res) => {
+  try {
+    const { ticker, side, dollarAmount } = req.body;
+    console.log(`Manual bet: ${ticker} ${side} $${dollarAmount}`);
+    const result = await placeBet(ticker, side, dollarAmount);
+    if (result.order?.error) return res.json({ success: false, error: result.order.error.message || result.order.error });
+    res.json({ success: true, ...result });
+  } catch (e) {
+    console.error("Bet error:", e.message);
+    res.json({ success: false, error: e.message });
+  }
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`Kalshi backend running on port ${PORT}`);
+  console.log(`Auto-trading: ENABLED — every 15 min — $5 max — $${DAILY_LIMIT}/day limit`);
+});
