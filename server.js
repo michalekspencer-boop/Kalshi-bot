@@ -46,7 +46,7 @@ function authHeaders(method, path) {
   };
 }
 
-async function getMarkets(limit = 100) {
+async function getMarkets(limit = 200) {
   const path = `/trade-api/v2/markets?limit=${limit}&status=open`;
   const res = await fetch(`https://api.elections.kalshi.com${path}`, {
     headers: authHeaders("GET", path),
