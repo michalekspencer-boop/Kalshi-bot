@@ -18,6 +18,8 @@ function timeAgo(ts) {
 function AutoTradePanel() {
   const [log, setLog] = useState([]);
   const [enabled, setEnabled] = useState(true);
+  const [dailySpend, setDailySpend] = useState(0);
+  const [dailyLimit, setDailyLimit] = useState(50);
   const [loading, setLoading] = useState(true);
 
   const fetchLog = async () => {
@@ -26,6 +28,8 @@ function AutoTradePanel() {
       const data = await res.json();
       setLog(data.log || []);
       setEnabled(data.enabled);
+      setDailySpend(data.dailySpend || 0);
+      setDailyLimit(data.dailyLimit || 50);
     } catch (e) {
       console.error("Failed to fetch log:", e);
     } finally {
@@ -34,9 +38,13 @@ function AutoTradePanel() {
   };
 
   const toggleAutoTrade = async () => {
-    const res = await fetch(`${BACKEND_URL}/api/autotrade/toggle`, { method: "POST" });
-    const data = await res.json();
-    setEnabled(data.enabled);
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/autotrade/toggle`, { method: "POST" });
+      const data = await res.json();
+      setEnabled(data.enabled);
+    } catch (e) {
+      console.error("Toggle failed:", e);
+    }
   };
 
   useEffect(() => {
@@ -46,59 +54,52 @@ function AutoTradePanel() {
   }, []);
 
   const betsPlaced = log.filter(e => e.type === "BET_PLACED");
-  const totalSpent = betsPlaced.reduce((s, e) => s + (e.data?.amount || 0), 0);
   const todayBets = betsPlaced.filter(e => Date.now() - e.timestamp < 86400000);
 
   const LOG_COLORS = {
-    BET_PLACED: "#4ade80",
-    BET_FAILED: "#f87171",
-    SCAN: "#475569",
-    ERROR: "#f87171",
-    ENABLED: "#4ade80",
-    DISABLED: "#facc15",
+    BET_PLACED: "#4ade80", BET_FAILED: "#f87171", SCAN: "#475569",
+    ERROR: "#f87171", ENABLED: "#4ade80", DISABLED: "#facc15", LIMIT: "#fb923c",
   };
 
   return (
     <div style={{ animation: "fadeIn 0.3s ease" }}>
-      {/* Status bar */}
       <div style={{ padding: "16px 20px", background: "#0a0f18", border: `1px solid ${enabled ? "#4ade8033" : "#f8717133"}`, borderRadius: 4, marginBottom: 20, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
         <div>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
             <div style={{ width: 8, height: 8, borderRadius: "50%", background: enabled ? "#4ade80" : "#f87171", animation: enabled ? "pulse 2s infinite" : "none" }} />
-            <div style={{ fontSize: 13, color: enabled ? "#4ade80" : "#f87171", fontWeight: 600 }}>
-              AUTO-TRADING {enabled ? "ACTIVE" : "PAUSED"}
-            </div>
+            <div style={{ fontSize: 13, color: enabled ? "#4ade80" : "#f87171", fontWeight: 600 }}>AUTO-TRADING {enabled ? "ACTIVE" : "PAUSED"}</div>
           </div>
-          <div style={{ fontSize: 11, color: "#475569" }}>
-            Scans every 15 min · $5 max per bet · A-grade signals only
-          </div>
+          <div style={{ fontSize: 11, color: "#475569" }}>Scans every 15 min · $5 max per bet · A-grade signals only · $50/day limit</div>
         </div>
-        <button onClick={toggleAutoTrade} style={{
-          background: enabled ? "#1a0808" : "#0a1a0f",
-          border: `1px solid ${enabled ? "#f87171" : "#4ade80"}`,
-          color: enabled ? "#f87171" : "#4ade80",
-          padding: "8px 16px", fontFamily: "inherit", fontSize: 11,
-          cursor: "pointer", borderRadius: 2, letterSpacing: "0.05em"
-        }}>
+        <button onClick={toggleAutoTrade} style={{ background: enabled ? "#1a0808" : "#0a1a0f", border: `1px solid ${enabled ? "#f87171" : "#4ade80"}`, color: enabled ? "#f87171" : "#4ade80", padding: "8px 16px", fontFamily: "inherit", fontSize: 11, cursor: "pointer", borderRadius: 2 }}>
           {enabled ? "⏸ PAUSE" : "▶ RESUME"}
         </button>
       </div>
 
-      {/* Stats */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 20 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginBottom: 20 }}>
         {[
           { label: "BETS TODAY", value: todayBets.length, color: "#38bdf8" },
-          { label: "TOTAL AUTO-BETS", value: betsPlaced.length, color: "#4ade80" },
-          { label: "TOTAL DEPLOYED", value: `$${totalSpent}`, color: "#facc15" },
+          { label: "ALL-TIME BETS", value: betsPlaced.length, color: "#4ade80" },
+          { label: "SPENT TODAY", value: `$${dailySpend}`, color: "#facc15" },
+          { label: "DAILY LIMIT", value: `$${dailyLimit}`, color: dailySpend >= dailyLimit ? "#f87171" : "#475569" },
         ].map(s => (
           <div key={s.label} style={{ padding: "14px", background: "#0a0f18", border: "1px solid #1e293b", borderRadius: 4, textAlign: "center" }}>
             <div style={{ fontSize: 9, color: "#334155", letterSpacing: "0.12em", marginBottom: 6 }}>{s.label}</div>
-            <div style={{ fontSize: 22, color: s.color, fontWeight: 700 }}>{s.value}</div>
+            <div style={{ fontSize: 20, color: s.color, fontWeight: 700 }}>{s.value}</div>
           </div>
         ))}
       </div>
 
-      {/* Recent auto-bets */}
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#475569", marginBottom: 6 }}>
+          <span>Daily spend</span>
+          <span style={{ color: dailySpend >= dailyLimit ? "#f87171" : "#94a3b8" }}>${dailySpend} / ${dailyLimit}</span>
+        </div>
+        <div style={{ height: 4, background: "#1e293b", borderRadius: 2, overflow: "hidden", marginBottom: 20 }}>
+          <div style={{ width: `${Math.min((dailySpend / dailyLimit) * 100, 100)}%`, height: "100%", background: dailySpend >= dailyLimit ? "#f87171" : "#4ade80", transition: "width 0.4s ease" }} />
+        </div>
+      </div>
+
       {betsPlaced.length > 0 && (
         <div style={{ marginBottom: 20 }}>
           <div style={{ fontSize: 10, color: "#4ade80", letterSpacing: "0.12em", marginBottom: 12 }}>RECENT AUTO-BETS</div>
@@ -120,7 +121,6 @@ function AutoTradePanel() {
         </div>
       )}
 
-      {/* Full activity log */}
       <div>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
           <div style={{ fontSize: 10, color: "#334155", letterSpacing: "0.12em" }}>FULL ACTIVITY LOG</div>
@@ -135,7 +135,7 @@ function AutoTradePanel() {
             {log.map((entry, i) => (
               <div key={i} style={{ display: "flex", gap: 12, alignItems: "flex-start", padding: "8px 12px", borderBottom: "1px solid #0a0f18" }}>
                 <div style={{ fontSize: 10, color: "#334155", whiteSpace: "nowrap", marginTop: 1 }}>{timeAgo(entry.timestamp)}</div>
-                <div style={{ width: 80, fontSize: 10, color: LOG_COLORS[entry.type] || "#475569", letterSpacing: "0.05em", flexShrink: 0 }}>{entry.type}</div>
+                <div style={{ width: 80, fontSize: 10, color: LOG_COLORS[entry.type] || "#475569", flexShrink: 0 }}>{entry.type}</div>
                 <div style={{ fontSize: 11, color: entry.type === "BET_PLACED" ? "#e2e8f0" : "#475569", lineHeight: 1.5 }}>{entry.message}</div>
               </div>
             ))}
@@ -325,7 +325,10 @@ export default function KalshiBot() {
   const [scanning, setScanning] = useState(false);
   const [error, setError] = useState(null);
 
-  const showToast = (msg, type = "success") => { setToast({ msg, type }); setTimeout(() => setToast(null), 3000); };
+  const showToast = (msg, type = "success") => {
+    setToast({ msg, type });
+    setTimeout(() => setToast(null), 3000);
+  };
 
   const handleScan = async () => {
     setScanning(true); setError(null);
@@ -359,7 +362,9 @@ export default function KalshiBot() {
       } else {
         showToast(`Bet failed: ${data.error}`, "neutral");
       }
-    } catch (e) { showToast("Could not place bet: " + e.message, "neutral"); }
+    } catch (e) {
+      showToast("Could not place bet: " + e.message, "neutral");
+    }
   };
 
   const handleReject = (id) => {
@@ -402,7 +407,12 @@ export default function KalshiBot() {
           </div>
           <div style={{ width: 1, height: 32, background: "#0f1e30" }} />
           <div style={{ display: "flex", gap: 20 }}>
-            {[{ label: "PENDING", value: bets.length, color: "#38bdf8" }, { label: "PLACED", value: approved.length, color: "#4ade80" }, { label: "SKIPPED", value: rejected.length, color: "#475569" }, { label: "DEPLOYED", value: `$${totalApprovedValue}`, color: "#facc15" }].map(stat => (
+            {[
+              { label: "PENDING", value: bets.length, color: "#38bdf8" },
+              { label: "PLACED", value: approved.length, color: "#4ade80" },
+              { label: "SKIPPED", value: rejected.length, color: "#475569" },
+              { label: "DEPLOYED", value: `$${totalApprovedValue}`, color: "#facc15" },
+            ].map(stat => (
               <div key={stat.label}>
                 <div style={{ fontSize: 9, color: "#334155", letterSpacing: "0.12em" }}>{stat.label}</div>
                 <div style={{ fontSize: 16, color: stat.color, fontWeight: 600 }}>{stat.value}</div>
@@ -416,7 +426,7 @@ export default function KalshiBot() {
             LIVE
           </div>
           <button onClick={handleScan} style={{ background: scanning ? "#0a1a2e" : "transparent", border: "1px solid #1e4d7b", color: "#38bdf8", padding: "7px 16px", fontFamily: "inherit", fontSize: 11, cursor: "pointer", letterSpacing: "0.08em", borderRadius: 2 }}>
-            {scanning ? <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ display: "inline-block", animation: "spin 0.8s linear infinite" }}>◌</span> SCANNING...</span> : "⟳ SCAN"}
+            {scanning ? <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ display: "inline-block", animation: "spin 0.8s linear infinite" }}>◌</span> SCANNING...</span> : "⟳ SCAN FOR SIGNALS"}
           </button>
         </div>
       </div>
@@ -433,14 +443,18 @@ export default function KalshiBot() {
       </div>
 
       <div style={{ padding: "20px 28px", maxWidth: 800 }}>
-        {error && <div style={{ padding: "12px 16px", marginBottom: 16, background: "#1a0808", border: "1px solid #f8717144", color: "#f87171", fontSize: 12, borderRadius: 3 }}>⚠ {error}</div>}
+        {error && (
+          <div style={{ padding: "12px 16px", marginBottom: 16, background: "#1a0808", border: "1px solid #f8717144", color: "#f87171", fontSize: 12, borderRadius: 3 }}>⚠ {error}</div>
+        )}
 
         {activeTab === "queue" && (
           <div style={{ animation: "fadeIn 0.3s ease" }}>
             <div style={{ display: "flex", gap: 8, marginBottom: 18, alignItems: "center" }}>
               <span style={{ fontSize: 10, color: "#334155", marginRight: 4 }}>FILTER</span>
               {["all", "weather", "economic", "sports", "political"].map(cat => (
-                <button key={cat} className={`filter-btn${filter === cat ? " active" : ""}`} style={filter === cat ? { background: CATEGORY_COLOR[cat] || "#38bdf8", borderColor: CATEGORY_COLOR[cat] || "#38bdf8" } : {}} onClick={() => setFilter(cat)}>
+                <button key={cat} className={`filter-btn${filter === cat ? " active" : ""}`}
+                  style={filter === cat ? { background: CATEGORY_COLOR[cat] || "#38bdf8", borderColor: CATEGORY_COLOR[cat] || "#38bdf8" } : {}}
+                  onClick={() => setFilter(cat)}>
                   {cat === "all" ? "ALL" : `${CATEGORY_ICON[cat]} ${cat.toUpperCase()}`}
                 </button>
               ))}
@@ -470,7 +484,10 @@ export default function KalshiBot() {
                     <div style={{ fontSize: 10, color: "#4ade80", letterSpacing: "0.12em", marginBottom: 12 }}>CONFIRMED BETS</div>
                     {approved.map(b => (
                       <div key={b.id} style={{ padding: "12px 16px", marginBottom: 8, background: "#0a1a0f", border: "1px solid #4ade8022", borderLeft: "3px solid #4ade80", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                        <div><div style={{ fontSize: 12, color: "#e2e8f0", marginBottom: 3 }}>{b.market}</div><div style={{ fontSize: 11, color: "#4ade8099" }}>BUY {b.side} · {b.strategy}</div></div>
+                        <div>
+                          <div style={{ fontSize: 12, color: "#e2e8f0", marginBottom: 3 }}>{b.market}</div>
+                          <div style={{ fontSize: 11, color: "#4ade8099" }}>BUY {b.side} · {b.strategy}</div>
+                        </div>
                         <div style={{ textAlign: "right" }}>
                           <div style={{ fontSize: 14, color: "#4ade80", fontWeight: 600 }}>${b.finalSize}</div>
                           <div style={{ fontSize: 10, color: "#334155" }}>{timeAgo(b.approvedAt)}</div>
@@ -484,7 +501,10 @@ export default function KalshiBot() {
                     <div style={{ fontSize: 10, color: "#475569", letterSpacing: "0.12em", marginBottom: 12 }}>SKIPPED</div>
                     {rejected.map(b => (
                       <div key={b.id} style={{ padding: "12px 16px", marginBottom: 8, background: "#0a0f14", border: "1px solid #1e293b", borderLeft: "3px solid #1e293b", display: "flex", justifyContent: "space-between", opacity: 0.6 }}>
-                        <div><div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 3 }}>{b.market}</div><div style={{ fontSize: 11, color: "#334155" }}>{b.strategy}</div></div>
+                        <div>
+                          <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 3 }}>{b.market}</div>
+                          <div style={{ fontSize: 11, color: "#334155" }}>{b.strategy}</div>
+                        </div>
                         <div style={{ fontSize: 10, color: "#334155" }}>{timeAgo(b.rejectedAt)}</div>
                       </div>
                     ))}
