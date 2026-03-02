@@ -91,7 +91,7 @@ function getMispricingSignals(markets) {
       const sum = (m.yes_bid + m.no_bid) / 100;
       const yes = m.yes_ask / 100;
       const no = m.no_ask / 100;
-      return sum < 0.92 && yes > 0.05 && yes < 0.95 && no < 100;
+      return sum < 0.92 && yes > 0.05 && yes < 0.95 && no > 0 && no < 100;
     })
     .map(m => {
       const yes = m.yes_ask / 100;
@@ -208,8 +208,9 @@ async function placeBet(ticker, side, dollarAmount) {
   const mktData = await mktRes.json();
   if (!mktData.market) throw new Error("Market not found");
   const market = mktData.market;
+  if (market.status !== "open") throw new Error(`Market not open: ${market.status}`);
   const price = side === "yes" ? market.yes_ask : market.no_ask;
-  if (!price || price <= 0) throw new Error(`Invalid price: ${price}`);
+  if (!price || price <= 0 || price >= 100) throw new Error(`Invalid price: ${price}`);
   const contracts = Math.max(1, Math.floor((dollarAmount * 100) / price));
   const orderPath = `/trade-api/v2/portfolio/orders`;
   const orderRes = await fetch(`https://api.elections.kalshi.com${orderPath}`, {
@@ -230,7 +231,7 @@ async function runAutoTrade() {
   if (!autoTradeEnabled) return;
   logActivity("SCAN", "Auto-scan started");
   try {
-    const { markets } = await getMarkets(100);
+    const { markets } = await getMarkets(200);
     if (!markets) { logActivity("ERROR", "No markets returned"); return; }
     const [mispricing, noaa, fed] = await Promise.all([
       Promise.resolve(getMispricingSignals(markets)),
@@ -286,7 +287,7 @@ app.get("/api/health", (req, res) => {
 
 app.get("/api/signals", async (req, res) => {
   try {
-    const { markets } = await getMarkets(100);
+    const { markets } = await getMarkets(200);
     if (!markets) return res.json({ signals: [] });
     const [mispricing, noaa, fed] = await Promise.all([
       Promise.resolve(getMispricingSignals(markets)),
@@ -328,5 +329,5 @@ app.post("/api/bet", async (req, res) => {
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Kalshi backend running on port ${PORT}`);
-  console.log(`Auto-trading: ENABLED — every 15 min — $5 max — $${DAILY_LIMIT}/day limit`);
+  console.log(`Auto-trading: ENABLED — every 15 min — $5 max — $${DAILY_LIMIT}/day limit — 200 markets`);
 });
