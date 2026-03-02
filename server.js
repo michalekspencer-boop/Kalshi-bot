@@ -80,19 +80,34 @@ function getQualityLabel(score) {
   return "D";
 }
 
+function isValidMarket(m) {
+  const ticker = m.ticker.toLowerCase();
+  const title = m.title.toLowerCase();
+  // Filter out parlay and multi-game markets
+  if (ticker.includes("crosscategory") || ticker.includes("multigame") || ticker.includes("kxmv")) return false;
+  // Filter out sports prop markets
+  if (title.includes("wins by") || title.includes("points scored") ||
+      title.includes("rebounds") || title.includes("assists") ||
+      title.includes("goals scored") || title.includes("over 8.5") ||
+      title.includes("over 7.5") || title.includes("over 6.5") ||
+      title.includes("over 5.5") || title.includes("over 4.5") ||
+      title.includes("over 3.5") || title.includes("over 2.5") ||
+      title.includes("over 1.5") || title.includes(": 1+") ||
+      title.includes(": 2+") || title.includes(": 3+") ||
+      title.includes(": 4+") || title.includes(": 5+")) return false;
+  // Must have valid prices on both sides
+  const yes = m.yes_ask / 100;
+  const no = m.no_ask / 100;
+  const sum = (m.yes_bid + m.no_bid) / 100;
+  if (yes <= 0.05 || yes >= 0.95) return false;
+  if (no <= 0 || no >= 100) return false;
+  if (sum >= 0.92) return false;
+  return true;
+}
+
 function getMispricingSignals(markets) {
   return markets
-    .filter(m => {
-      if (m.ticker.includes("CROSSCATEGORY") || m.ticker.includes("MULTIGAME")) return false;
-      const title = m.title.toLowerCase();
-      if (title.includes("wins by") || title.includes("points scored") ||
-          title.includes("rebounds") || title.includes("assists") ||
-          title.includes(": 1+") || title.includes(": 2+") || title.includes(": 3+")) return false;
-      const sum = (m.yes_bid + m.no_bid) / 100;
-      const yes = m.yes_ask / 100;
-      const no = m.no_ask / 100;
-      return sum < 0.92 && yes > 0.05 && yes < 0.95 && no > 0 && no < 100;
-    })
+    .filter(isValidMarket)
     .map(m => {
       const yes = m.yes_ask / 100;
       const sum = (m.yes_bid + m.no_bid) / 100;
@@ -208,7 +223,7 @@ async function placeBet(ticker, side, dollarAmount) {
   const mktData = await mktRes.json();
   if (!mktData.market) throw new Error("Market not found");
   const market = mktData.market;
-  if (market.status !== "open") throw new Error(`Market not open: ${market.status}`);
+  if (market.status !== "open" && market.status !== "active") throw new Error(`Market not open: ${market.status}`);
   const price = side === "yes" ? market.yes_ask : market.no_ask;
   if (!price || price <= 0 || price >= 100) throw new Error(`Invalid price: ${price}`);
   const contracts = Math.max(1, Math.floor((dollarAmount * 100) / price));
