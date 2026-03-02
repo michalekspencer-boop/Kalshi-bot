@@ -37,15 +37,48 @@ async function getMarkets(limit = 100) {
   return res.json();
 }
 
+// ─── QUALITY SCORE ────────────────────────────────────────────────────────────
+function calcQualityScore(edge, dataSource, expiresIn, confidence) {
+  let score = 0;
+  // Edge strength (0-40 pts)
+  score += Math.min(40, Math.round(edge * 200));
+  // Data source reliability (0-30 pts)
+  const sourceScores = {
+    "NOAA Weather API (free)": 30,
+    "FRED (St. Louis Fed)": 28,
+    "Kalshi live market data": 15,
+  };
+  score += sourceScores[dataSource] || 10;
+  // Time until expiry sweet spot 1-7 days (0-20 pts)
+  if (expiresIn) {
+    try {
+      const daysLeft = (new Date(expiresIn) - Date.now()) / (1000 * 60 * 60 * 24);
+      if (daysLeft >= 1 && daysLeft <= 7) score += 20;
+      else if (daysLeft > 7 && daysLeft <= 30) score += 10;
+      else if (daysLeft < 1) score += 5;
+    } catch (e) {}
+  }
+  // Confidence (0-10 pts)
+  if (confidence === "High") score += 10;
+  else if (confidence === "Medium") score += 5;
+  return Math.min(100, score);
+}
+
+function getQualityLabel(score) {
+  if (score >= 80) return "A+";
+  if (score >= 65) return "A";
+  if (score >= 50) return "B";
+  if (score >= 35) return "C";
+  return "D";
+}
+
 // ─── MISPRICING STRATEGY ─────────────────────────────────────────────────────
 function getMispricingSignals(markets) {
   return markets
     .filter(m => {
-      // Filter out parlay/cross-category markets
       if (m.ticker.includes("CROSSCATEGORY") || m.ticker.includes("MULTIGAME")) return false;
-      // Filter out sports markets
       const title = m.title.toLowerCase();
-      if (title.includes("wins by") || title.includes("points scored") || 
+      if (title.includes("wins by") || title.includes("points scored") ||
           title.includes("rebounds") || title.includes("assists") ||
           title.includes(": 1+") || title.includes(": 2+") || title.includes(": 3+")) return false;
       const sum = (m.yes_bid + m.no_bid) / 100;
@@ -57,14 +90,15 @@ function getMispricingSignals(markets) {
       const yes = m.yes_ask / 100;
       const sum = (m.yes_bid + m.no_bid) / 100;
       const edge = parseFloat((Math.abs(0.5 - Math.min(yes, 1 - yes))).toFixed(2));
-      // Detect category from ticker
       const ticker = m.ticker.toLowerCase();
       const title = m.title.toLowerCase();
       let category = "economic";
       if (ticker.includes("weather") || ticker.includes("snow") || ticker.includes("rain") || ticker.includes("temp")) category = "weather";
       else if (ticker.includes("nba") || ticker.includes("nfl") || ticker.includes("mlb") || ticker.includes("nhl") || ticker.includes("sport") || title.includes("game") || title.includes("match")) category = "sports";
       else if (ticker.includes("pol") || ticker.includes("elect") || title.includes("president") || title.includes("senate") || title.includes("congress")) category = "political";
-
+      const expiresIn = m.close_time ? new Date(m.close_time).toLocaleDateString() : "unknown";
+      const confidence = edge > 0.1 ? "High" : "Medium";
+      const dataSource = "Kalshi live market data";
       return {
         id: m.ticker,
         strategy: "Mispricing Detector",
@@ -77,10 +111,12 @@ function getMispricingSignals(markets) {
         kalshiProb: parseFloat(Math.min(yes, 1 - yes).toFixed(2)),
         recommendedSize: 25,
         maxSize: 100,
-        dataSource: "Kalshi live market data",
+        dataSource,
         reasoning: `Yes ask: ${m.yes_ask}c, No ask: ${m.no_ask}c. Combined bid price is ${Math.round(sum * 100)}c — potential mispricing detected.`,
-        confidence: edge > 0.1 ? "High" : "Medium",
-        expiresIn: m.close_time ? new Date(m.close_time).toLocaleDateString() : "unknown",
+        confidence,
+        expiresIn,
+        qualityScore: calcQualityScore(edge, dataSource, expiresIn, confidence),
+        qualityLabel: getQualityLabel(calcQualityScore(edge, dataSource, expiresIn, confidence)),
         timestamp: Date.now(),
       };
     });
@@ -96,26 +132,25 @@ async function getNOAASignals(markets) {
     m.title.toLowerCase().includes("hurricane") ||
     m.title.toLowerCase().includes("inches")
   );
-
   for (const market of weatherMarkets.slice(0, 5)) {
     try {
       const pointRes = await fetch("https://api.weather.gov/points/40.7128,-74.0060");
       const pointData = await pointRes.json();
       if (!pointData.properties) continue;
-
       const forecastRes = await fetch(pointData.properties.forecast);
       const forecastData = await forecastRes.json();
       if (!forecastData.properties) continue;
-
       const periods = forecastData.properties.periods;
       const pop = periods[0]?.probabilityOfPrecipitation?.value;
       if (pop === null || pop === undefined) continue;
-
       const noaaProb = pop / 100;
       const kalshiProb = market.yes_ask / 100;
       const edge = noaaProb - kalshiProb;
-
       if (Math.abs(edge) > 0.07) {
+        const expiresIn = market.close_time ? new Date(market.close_time).toLocaleDateString() : "soon";
+        const confidence = Math.abs(edge) > 0.12 ? "High" : "Medium";
+        const dataSource = "NOAA Weather API (free)";
+        const qs = calcQualityScore(Math.abs(edge), dataSource, expiresIn, confidence);
         signals.push({
           id: `noaa_${market.ticker}`,
           strategy: "NOAA Weather Model",
@@ -128,10 +163,12 @@ async function getNOAASignals(markets) {
           kalshiProb: parseFloat(kalshiProb.toFixed(2)),
           recommendedSize: Math.min(75, Math.round(Math.abs(edge) * 300)),
           maxSize: 100,
-          dataSource: "NOAA Weather API (free)",
+          dataSource,
           reasoning: `NOAA gives ${Math.round(noaaProb * 100)}% precipitation probability. Kalshi prices it at ${Math.round(kalshiProb * 100)}c. Edge: ${Math.round(Math.abs(edge) * 100)} points.`,
-          confidence: Math.abs(edge) > 0.12 ? "High" : "Medium",
-          expiresIn: market.close_time ? new Date(market.close_time).toLocaleDateString() : "soon",
+          confidence,
+          expiresIn,
+          qualityScore: qs,
+          qualityLabel: getQualityLabel(qs),
           timestamp: Date.now(),
         });
       }
@@ -151,9 +188,7 @@ async function getFedSignals(markets) {
     m.title.toLowerCase().includes("interest rate") ||
     m.title.toLowerCase().includes("federal funds")
   );
-
   if (fedMarkets.length === 0) return signals;
-
   try {
     const fredRes = await fetch(
       `https://api.stlouisfed.org/fred/series/observations?series_id=FEDTARMD&api_key=${process.env.FRED_API_KEY}&sort_order=desc&limit=1&file_type=json`
@@ -161,9 +196,7 @@ async function getFedSignals(markets) {
     const fredData = await fredRes.json();
     const currentRate = parseFloat(fredData.observations?.[0]?.value);
     if (isNaN(currentRate)) return signals;
-
     console.log(`Current Fed rate from FRED: ${currentRate}%`);
-
     for (const market of fedMarkets.slice(0, 5)) {
       const kalshiProb = market.yes_ask / 100;
       const isHold = market.title.toLowerCase().includes("hold") ||
@@ -171,8 +204,11 @@ async function getFedSignals(markets) {
                      market.title.toLowerCase().includes("pause");
       const modelProb = isHold ? 0.75 : 0.35;
       const edge = modelProb - kalshiProb;
-
       if (Math.abs(edge) > 0.05) {
+        const expiresIn = market.close_time ? new Date(market.close_time).toLocaleDateString() : "soon";
+        const confidence = Math.abs(edge) > 0.08 ? "High" : "Medium";
+        const dataSource = "FRED (St. Louis Fed)";
+        const qs = calcQualityScore(Math.abs(edge), dataSource, expiresIn, confidence);
         signals.push({
           id: `fed_${market.ticker}`,
           strategy: "Fed Rate Tracker",
@@ -185,10 +221,12 @@ async function getFedSignals(markets) {
           kalshiProb: parseFloat(kalshiProb.toFixed(2)),
           recommendedSize: Math.min(100, Math.round(Math.abs(edge) * 400)),
           maxSize: 150,
-          dataSource: "FRED (St. Louis Fed)",
+          dataSource,
           reasoning: `Current Fed funds rate: ${currentRate}%. Model probability: ${Math.round(modelProb * 100)}%. Kalshi: ${Math.round(kalshiProb * 100)}c. Edge: ${Math.round(Math.abs(edge) * 100)} points.`,
-          confidence: Math.abs(edge) > 0.08 ? "High" : "Medium",
-          expiresIn: market.close_time ? new Date(market.close_time).toLocaleDateString() : "soon",
+          confidence,
+          expiresIn,
+          qualityScore: qs,
+          qualityLabel: getQualityLabel(qs),
           timestamp: Date.now(),
         });
       }
@@ -214,16 +252,13 @@ app.get("/api/signals", async (req, res) => {
   try {
     const { markets } = await getMarkets(100);
     if (!markets) return res.json({ signals: [] });
-
     const [mispricing, noaa, fed] = await Promise.all([
       Promise.resolve(getMispricingSignals(markets)),
       getNOAASignals(markets),
       getFedSignals(markets),
     ]);
-
     const signals = [...mispricing, ...noaa, ...fed]
-      .sort((a, b) => b.yourEdge - a.yourEdge);
-
+      .sort((a, b) => b.qualityScore - a.qualityScore);
     console.log(`Signals — mispricing: ${mispricing.length}, noaa: ${noaa.length}, fed: ${fed.length}`);
     res.json({ signals });
   } catch (e) {
@@ -236,7 +271,6 @@ app.post("/api/bet", async (req, res) => {
   try {
     const { ticker, side, dollarAmount } = req.body;
     console.log(`Bet request: ${ticker} ${side} $${dollarAmount}`);
-
     const mktPath = `/trade-api/v2/markets/${ticker}`;
     const mktRes = await fetch(`https://api.elections.kalshi.com${mktPath}`, {
       headers: authHeaders("GET", mktPath),
@@ -246,16 +280,13 @@ app.post("/api/bet", async (req, res) => {
       console.error("Market not found:", JSON.stringify(mktData));
       return res.json({ success: false, error: "Market not found" });
     }
-
     const market = mktData.market;
     const price = side === "yes" ? market.yes_ask : market.no_ask;
     if (!price || price <= 0) {
       return res.json({ success: false, error: `Invalid price: ${price}` });
     }
-
     const contracts = Math.max(1, Math.floor((dollarAmount * 100) / price));
     console.log(`Placing order: ${contracts} contracts at ${price}c`);
-
     const orderPath = `/trade-api/v2/portfolio/orders`;
     const orderRes = await fetch(`https://api.elections.kalshi.com${orderPath}`, {
       method: "POST",
@@ -270,10 +301,8 @@ app.post("/api/bet", async (req, res) => {
         client_order_id: `bot_${Date.now()}`,
       }),
     });
-
     const order = await orderRes.json();
     console.log("Order response:", JSON.stringify(order));
-
     if (order.error) {
       return res.json({ success: false, error: order.error.message || order.error });
     }
